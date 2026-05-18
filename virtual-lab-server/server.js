@@ -83,7 +83,25 @@ io.on('connection', (socket) => {
     if (socket.roomId) socket.to(socket.roomId).emit('receive_drag', data);
   });
 
-  // ── Clear canvas ──────────────────────────────────────────────
+  // ── Constraint sync ────────────────────────────────────────
+  socket.on('spawn_constraint', (data) => {
+    if (socket.roomId) socket.to(socket.roomId).emit('receive_constraint', data);
+  });
+
+  socket.on('delete_constraint', (data) => {
+    if (socket.roomId) socket.to(socket.roomId).emit('receive_delete_constraint', data);
+  });
+
+  socket.on('update_constraint', (data) => {
+    if (socket.roomId) socket.to(socket.roomId).emit('receive_update_constraint', data);
+  });
+
+  // ── Body deletion (cut tool) ─────────────────────────────
+  socket.on('delete_body', (data) => {
+    if (socket.roomId) socket.to(socket.roomId).emit('receive_delete_body', data);
+  });
+
+  // ── Clear canvas ──────────────────────────────────────────
   socket.on('clear_canvas', () => {
     if (socket.roomId) socket.to(socket.roomId).emit('receive_clear');
   });

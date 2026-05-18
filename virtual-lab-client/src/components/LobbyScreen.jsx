@@ -196,7 +196,7 @@ const LobbyScreen = ({ onJoin }) => {
               type="text"
               value={userName}
               onChange={(e) => setUserName(e.target.value)}
-              placeholder="Newton"
+              placeholder=""
               maxLength={20}
               style={{
                 width: '100%',
@@ -231,7 +231,7 @@ const LobbyScreen = ({ onJoin }) => {
               value={roomId}
               onChange={(e) => { setRoomId(e.target.value); setError(''); }}
               onKeyDown={(e) => e.key === 'Enter' && handleJoin()}
-              placeholder="alpha-lab"
+              placeholder=""
               maxLength={30}
               style={{
                 width: '100%',

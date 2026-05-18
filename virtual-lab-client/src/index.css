@@ -46,3 +46,16 @@ input[type="range"]::-webkit-slider-thumb {
 input[type="range"]::-webkit-slider-thumb:hover {
   border-color: #64748b;
 }
+
+/* ── Link Tool ─────────────────────────────────────────── */
+.link-mode-cursor canvas { cursor: crosshair !important; }
+
+@keyframes popoverIn {
+  from { opacity: 0; transform: translateY(8px) scale(0.96); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes pulseRing {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(15,118,110,0.4); }
+  50%      { box-shadow: 0 0 0 8px rgba(15,118,110,0); }
+}
