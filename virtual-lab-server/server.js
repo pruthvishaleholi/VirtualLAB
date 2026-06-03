@@ -14,6 +14,23 @@ mongoose.connect(MONGO_URI)
   .then(() => console.log('✔ MongoDB connected'))
   .catch((err) => console.error('✘ MongoDB connection error:', err.message));
 
+// Allow both localhost for development and your upcoming Vercel domain
+const allowedOrigins = [
+  'http://localhost:5173', 
+  'https://your-app-name.vercel.app' 
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
+}));
+
 // ── Simulation Model ────────────────────────────────────────────────────────
 const simulationSchema = new mongoose.Schema({
   name:        { type: String, required: true },
