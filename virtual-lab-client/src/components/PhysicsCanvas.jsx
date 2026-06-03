@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Matter from 'matter-js';
 import { io } from 'socket.io-client';
-import AnalyticsDashboard from './AnalyticsDashboard';
+import BodyAnalytics from './BodyAnalytics';
 import MaterialsPanel from './MaterialsPanel';
 import ConstraintConfigPopover from './ConstraintConfigPopover';
 import ConstraintOverlay from './ConstraintOverlay';
@@ -48,6 +48,17 @@ function receiveBodyFromData(data, Matter) {
   } else if (data.type === 'ramp') {
     const { bodies } = spawnRamp(Matter, data.label);
     items.push(...bodies);
+  } else if (data.type === 'platform') {
+    const platform = Bodies.rectangle(data.x, data.y, data.w, data.h, {
+      isStatic: true,
+      label: data.label,
+      _w: data.w, _h: data.h,
+      render: { fillStyle: data.color || '#64748b' },
+      friction: data.friction ?? 0.1,
+      restitution: data.restitution ?? 0.6,
+    });
+    Matter.Body.setAngle(platform, data.angle || 0);
+    items.push(platform);
   }
 
   return items;
@@ -71,6 +82,46 @@ function serializeWorld(engine) {
     }));
 }
 
+// ── Full world serialization (bodies + constraints + motors) for cloud save ──
+function serializeWorldFull(engine, bodyMotors, simRunning) {
+  const { Composite } = Matter;
+  const allBodies = Composite.allBodies(engine.world)
+    .filter((b) => !b.label?.startsWith('wall') && b.label !== 'ground');
+  const allConstraints = Composite.allConstraints(engine.world)
+    .filter((c) => c.label !== 'Mouse Constraint');
+
+  const bodies = allBodies.map((b) => {
+    const isCircle = b.circleRadius > 0;
+    let w = b._w, h = b._h;
+    if (w == null || h == null) {
+      const v = b.vertices;
+      if (v && v.length >= 3) {
+        w = Math.sqrt((v[1].x - v[0].x) ** 2 + (v[1].y - v[0].y) ** 2);
+        h = Math.sqrt((v[2].x - v[1].x) ** 2 + (v[2].y - v[1].y) ** 2);
+      } else {
+        w = b.bounds.max.x - b.bounds.min.x;
+        h = b.bounds.max.y - b.bounds.min.y;
+      }
+    }
+    return {
+      label: b.label, x: b.position.x, y: b.position.y,
+      angle: b.angle, vx: b.velocity.x, vy: b.velocity.y,
+      isCircle, circleRadius: b.circleRadius,
+      width: w, height: h, mass: b.mass,
+      isStatic: b.isStatic, color: b.render?.fillStyle || '#3b82f6',
+      friction: b.friction, restitution: b.restitution, frictionAir: b.frictionAir,
+    };
+  });
+
+  const constraints = allConstraints.map((c) => ({
+    bodyALabel: c.bodyA?.label, bodyBLabel: c.bodyB?.label,
+    length: c.length, stiffness: c.stiffness,
+    strokeStyle: c.render?.strokeStyle, lineWidth: c.render?.lineWidth,
+  }));
+
+  return { bodies, constraints, bodyMotors: { ...bodyMotors }, simRunning };
+}
+
 
 // ── PhysicsCanvas component ───────────────────────────────────────────────────
 const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
@@ -84,14 +135,31 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
   const isHostRef = useRef(false);
   const draggedLabelRef = useRef(null); // label of body currently being dragged locally
   const pendingHostSync = useRef(null); // buffered host state, applied in afterUpdate
+  const simRunningRef = useRef(true);   // is the simulation playing?
+  const bodyHistoryRef = useRef({});     // { [label]: [{t, speed, angVel, x, y, ke, pe}] }
+  const bodyNameCounterRef = useRef({ box: 0, circle: 0, other: 0 }); // for friendly names
+  const bodyNamesRef = useRef({});       // { [label]: 'Box 1' }
+  const selectedBodyIdxRef = useRef(0);
+  const renderRef = useRef(null);
 
-  const [analyticsData, setAnalyticsData] = useState([]);
+  const [perBodySnapshot, setPerBodySnapshot] = useState({ list: [], selected: null, systemStats: null });
+  const [selectedBodyIdx, setSelectedBodyIdx] = useState(0);
   const [materials, setMaterials] = useState({ gravity: 1, friction: 0.1, restitution: 0.6, airFriction: 0.01 });
   const [userCount, setUserCount] = useState(1);
   const [isHost, setIsHost] = useState(false);
   const [showAnalytics, setShowAnalytics] = useState(true);
   const [showMaterials, setShowMaterials] = useState(false);
   const [hasSave, setHasSave] = useState(!!localStorage.getItem('vlab_save'));
+  const [simRunning, setSimRunning] = useState(true);
+
+  // ── Cloud Save/Load state ──────────────────────────────────────────────────
+  const [showSaveModal, setShowSaveModal] = useState(false);
+  const [showLoadModal, setShowLoadModal] = useState(false);
+  const [saveName, setSaveName] = useState('');
+  const [cloudSaving, setCloudSaving] = useState(false);
+  const [cloudLoading, setCloudLoading] = useState(false);
+  const [savedSims, setSavedSims] = useState([]);
+  const [cloudMsg, setCloudMsg] = useState('');
 
   // ── Link Tool state ────────────────────────────────────────────────────────
   const [activeTool, setActiveTool] = useState('select'); // 'select' | 'link' | 'pivot' | 'cut' | 'platform'
@@ -103,6 +171,7 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
   const [canvasSize, setCanvasSize] = useState({ w: 800, h: 600 });
   const [platformStart, setPlatformStart] = useState(null); // { x, y } first click for platform tool
   const motorsRef = useRef(new Map());                     // uid -> { bodyB, angularVelocity }
+  const bodyMotorsRef = useRef({});                         // label -> { angularVelocity, angularAcceleration, currentVel }
   const constraintsMapRef = useRef(new Map());             // uid -> { constraint, type, config }
   const activeToolRef = useRef('select');
   const mcRef = useRef(null);
@@ -198,7 +267,7 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
     });
 
     // ── Room state sync: receive all existing items when joining ──────
-    socket.on('room_state', ({ bodies: bodyArr, constraints: constraintArr }) => {
+    socket.on('room_state', ({ bodies: bodyArr, constraints: constraintArr, bodyMotors: motorsData, simRunning: remoteSimRunning }) => {
       const labelToBody = {};
       bodyArr.forEach((b) => {
         let body;
@@ -218,6 +287,8 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
         }
         Body.setAngle(body, b.angle || 0);
         if (!b.isStatic) Body.setVelocity(body, { x: b.vx || 0, y: b.vy || 0 });
+        // Apply mass if provided (otherwise default from area)
+        if (b.mass != null && !b.isStatic) Body.setMass(body, b.mass);
         labelToBody[b.label] = body;
         Composite.add(engine.world, body);
       });
@@ -233,6 +304,20 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
           }
         });
       }
+      // Restore body motor configs
+      if (motorsData) {
+        Object.entries(motorsData).forEach(([label, motorConf]) => {
+          bodyMotorsRef.current[label] = { ...motorConf };
+        });
+      }
+      // Sync simulation running state from host
+      if (remoteSimRunning != null) {
+        simRunningRef.current = remoteSimRunning;
+        setSimRunning(remoteSimRunning);
+        if (remoteSimRunning) {
+          engine.gravity.y = materialsRef.current.gravity;
+        }
+      }
     });
 
     // ── Provide live state snapshot to a new joiner ──────────────────
@@ -244,12 +329,24 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
 
       const bodies = allBodies.map((b) => {
         const isCircle = b.circleRadius > 0;
+        // Compute true dimensions from vertices (edge lengths), not from AABB bounds
+        // which are inflated for rotated bodies
+        let w = b._w, h = b._h;
+        if (w == null || h == null) {
+          const v = b.vertices;
+          if (v && v.length >= 3) {
+            w = Math.sqrt((v[1].x - v[0].x) ** 2 + (v[1].y - v[0].y) ** 2);
+            h = Math.sqrt((v[2].x - v[1].x) ** 2 + (v[2].y - v[1].y) ** 2);
+          } else {
+            w = b.bounds.max.x - b.bounds.min.x;
+            h = b.bounds.max.y - b.bounds.min.y;
+          }
+        }
         return {
           label: b.label, x: b.position.x, y: b.position.y,
           angle: b.angle, vx: b.velocity.x, vy: b.velocity.y,
           isCircle, circleRadius: b.circleRadius,
-          width: b._w ?? (b.bounds.max.x - b.bounds.min.x),
-          height: b._h ?? (b.bounds.max.y - b.bounds.min.y),
+          width: w, height: h, mass: b.mass,
           isStatic: b.isStatic, color: b.render?.fillStyle || '#3b82f6',
           friction: b.friction, restitution: b.restitution, frictionAir: b.frictionAir,
         };
@@ -261,7 +358,13 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
         strokeStyle: c.render?.strokeStyle, lineWidth: c.render?.lineWidth,
       }));
 
-      socket.emit('state_snapshot', { targetSocketId: requesterSocketId, bodies, constraints });
+      socket.emit('state_snapshot', {
+        targetSocketId: requesterSocketId,
+        bodies,
+        constraints,
+        bodyMotors: { ...bodyMotorsRef.current },
+        simRunning: simRunningRef.current,
+      });
     });
 
     // ── Host sync: buffer incoming state, apply in afterUpdate ──────────
@@ -288,6 +391,85 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
       Composite.remove(engine.world, Composite.allConstraints(engine.world).filter((c) => c.label !== 'Mouse Constraint'));
       motorsRef.current.clear();
       constraintsMapRef.current.clear();
+    });
+
+    // ── Simulation start/stop sync ──────────────────────────────────────
+    socket.on('receive_toggle_sim', ({ running }) => {
+      simRunningRef.current = running;
+      setSimRunning(running);
+      if (running && engine) {
+        engine.gravity.y = materialsRef.current.gravity;
+      }
+    });
+
+    // ── Body property update sync ──────────────────────────────────────
+    socket.on('receive_update_body', ({ label, prop, value }) => {
+      const body = Composite.allBodies(engine.world).find(b => b.label === label);
+      if (!body) return;
+
+      switch (prop) {
+        case 'mass':
+          Body.setMass(body, Math.max(0.1, value));
+          break;
+        case 'radius': {
+          const oldR = body.circleRadius || 30;
+          if (oldR > 0 && value > 0) {
+            const s = value / oldR;
+            Body.scale(body, s, s);
+            body.circleRadius = value;
+          }
+          break;
+        }
+        case 'width': {
+          const oldW = body._w || 60;
+          if (oldW > 0 && value > 0) {
+            const savedAngle = body.angle;
+            Body.setAngle(body, 0);
+            Body.scale(body, value / oldW, 1);
+            Body.setAngle(body, savedAngle);
+            body._w = value;
+          }
+          break;
+        }
+        case 'height': {
+          const oldH = body._h || 60;
+          if (oldH > 0 && value > 0) {
+            const savedAngle = body.angle;
+            Body.setAngle(body, 0);
+            Body.scale(body, 1, value / oldH);
+            Body.setAngle(body, savedAngle);
+            body._h = value;
+          }
+          break;
+        }
+        case 'friction':
+          body.friction = Math.max(0, value);
+          break;
+        case 'restitution':
+          body.restitution = Math.max(0, Math.min(1, value));
+          break;
+        case 'motor_toggle': {
+          if (value) {
+            bodyMotorsRef.current[label] = { angularVelocity: 0.1, angularAcceleration: 0, currentVel: 0.1 };
+          } else {
+            delete bodyMotorsRef.current[label];
+            Body.setAngularVelocity(body, 0);
+          }
+          break;
+        }
+        case 'motor_angularVelocity': {
+          const m = bodyMotorsRef.current[label];
+          if (m) { m.angularVelocity = value; m.currentVel = value; }
+          break;
+        }
+        case 'motor_angularAcceleration': {
+          const m = bodyMotorsRef.current[label];
+          if (m) m.angularAcceleration = value;
+          break;
+        }
+        default:
+          break;
+      }
     });
 
     // ── Constraint sync (receive from peers) ──────────────────────────────
@@ -371,6 +553,17 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
     Events.on(engine, 'beforeUpdate', () => {
       const now = Date.now();
 
+      // ── Pause mode: zero gravity, freeze all non-dragged bodies ────────
+      if (!simRunningRef.current) {
+        engine.gravity.y = 0;
+        const allDyn = Composite.allBodies(engine.world).filter(b => !b.isStatic);
+        allDyn.forEach(b => {
+          if (b.label === draggedLabelRef.current) return; // let dragged body move
+          Body.setVelocity(b, { x: 0, y: 0 });
+          Body.setAngularVelocity(b, 0);
+        });
+      }
+
       // Drag sync: emit position of dragged body to other users
       if (isDragging && mc.body) {
         if (now - lastDragEmit.current >= 33) {
@@ -380,7 +573,7 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
         }
       }
 
-      // Host sync: periodically broadcast all body positions to peers
+      // Host sync: periodically broadcast all body state to peers
       if (isHostRef.current && now - lastHostSync.current >= HOST_SYNC_INTERVAL) {
         lastHostSync.current = now;
         const dynamicBodies = Composite.allBodies(engine.world)
@@ -392,15 +585,31 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
             x: b.position.x, y: b.position.y,
             vx: b.velocity.x, vy: b.velocity.y,
             angle: b.angle,
+            _w: b._w, _h: b._h, mass: b.mass,
+            friction: b.friction, restitution: b.restitution,
+            circleRadius: b.circleRadius || 0,
+            motor: bodyMotorsRef.current[b.label] || null,
           }));
           socket.emit('host_sync', syncData);
         }
       }
 
-      // Motor tick: drive motorized joints
-      motorsRef.current.forEach(({ bodyB, angularVelocity }) => {
-        Body.setAngularVelocity(bodyB, angularVelocity);
-      });
+      // Motor tick: drive motorized joints (only when playing)
+      if (simRunningRef.current) {
+        motorsRef.current.forEach(({ bodyB, angularVelocity }) => {
+          Body.setAngularVelocity(bodyB, angularVelocity);
+        });
+
+        // Per-body motors
+        const allDynMotor = Composite.allBodies(engine.world).filter(b => !b.isStatic);
+        allDynMotor.forEach(b => {
+          const m = bodyMotorsRef.current[b.label];
+          if (!m) return;
+          // Apply acceleration
+          m.currentVel = (m.currentVel || m.angularVelocity) + (m.angularAcceleration || 0) * (1/60);
+          Body.setAngularVelocity(b, m.currentVel);
+        });
+      }
     });
 
     // ── Apply host sync + Analytics (both in afterUpdate) ──────────────────
@@ -409,6 +618,9 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
       if (pendingHostSync.current && !isHostRef.current) {
         const syncData = pendingHostSync.current;
         pendingHostSync.current = null;
+
+        // When paused, only apply property changes (dimensions/mass/motor), skip position snaps
+        const applyPositions = simRunningRef.current;
 
         const allBodies = Composite.allBodies(engine.world);
         const bodyMap = {};
@@ -420,27 +632,197 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
           // Skip body being dragged locally — dragger owns it
           if (draggedLabelRef.current === hb.label) return;
 
-          // Full snap: set exact position, velocity, angle from host
-          Body.setPosition(localBody, { x: hb.x, y: hb.y });
-          Body.setVelocity(localBody, { x: hb.vx, y: hb.vy });
-          Body.setAngle(localBody, hb.angle);
+          // Sync dimensions: scale body if host dimensions differ
+          if (hb._w != null && localBody._w != null && Math.abs(hb._w - localBody._w) > 0.5) {
+            const savedAngle = localBody.angle;
+            Body.setAngle(localBody, 0);
+            Body.scale(localBody, hb._w / localBody._w, 1);
+            Body.setAngle(localBody, savedAngle);
+            localBody._w = hb._w;
+          }
+          if (hb._h != null && localBody._h != null && Math.abs(hb._h - localBody._h) > 0.5) {
+            const savedAngle = localBody.angle;
+            Body.setAngle(localBody, 0);
+            Body.scale(localBody, 1, hb._h / localBody._h);
+            Body.setAngle(localBody, savedAngle);
+            localBody._h = hb._h;
+          }
+          // Sync circle radius
+          if (hb.circleRadius > 0 && localBody.circleRadius > 0 && Math.abs(hb.circleRadius - localBody.circleRadius) > 0.5) {
+            const s = hb.circleRadius / localBody.circleRadius;
+            Body.scale(localBody, s, s);
+            localBody.circleRadius = hb.circleRadius;
+          }
+          // Sync mass
+          if (hb.mass != null && Math.abs(hb.mass - localBody.mass) > 0.01) {
+            Body.setMass(localBody, hb.mass);
+          }
+          // Sync friction / restitution
+          if (hb.friction != null) localBody.friction = hb.friction;
+          if (hb.restitution != null) localBody.restitution = hb.restitution;
+          // Sync motor config
+          if (hb.motor) {
+            bodyMotorsRef.current[hb.label] = { ...hb.motor };
+          } else if (bodyMotorsRef.current[hb.label]) {
+            delete bodyMotorsRef.current[hb.label];
+          }
+
+          // Full snap: set exact position, velocity, angle from host (only when playing)
+          if (applyPositions) {
+            Body.setPosition(localBody, { x: hb.x, y: hb.y });
+            Body.setVelocity(localBody, { x: hb.vx, y: hb.vy });
+            Body.setAngle(localBody, hb.angle);
+          }
         });
       }
 
-      // Analytics
+      // Per-body analytics
       tickRef.current++;
       if (tickRef.current % 3 !== 0) return;
       const dyn = Composite.allBodies(engine.world).filter((b) => !b.isStatic);
-      if (dyn.length === 0) return;
-      const avgSpeed = dyn.reduce((s, b) => s + Math.hypot(b.velocity.x, b.velocity.y), 0) / dyn.length;
-      const avgAng = dyn.reduce((s, b) => s + Math.abs(b.angularVelocity), 0) / dyn.length;
-      setAnalyticsData((prev) => {
-        const next = [...prev, { t: tickRef.current, speed: +avgSpeed.toFixed(2), angularVel: +avgAng.toFixed(4) }];
-        return next.length > MAX_POINTS ? next.slice(-MAX_POINTS) : next;
+
+      // Assign friendly names to new bodies
+      dyn.forEach(b => {
+        if (!bodyNamesRef.current[b.label]) {
+          const kind = b.circleRadius ? 'circle' : 'box';
+          bodyNameCounterRef.current[kind] = (bodyNameCounterRef.current[kind] || 0) + 1;
+          const n = bodyNameCounterRef.current[kind];
+          bodyNamesRef.current[b.label] = kind === 'circle' ? `Circle ${n}` : `Box ${n}`;
+        }
+      });
+
+      // Collect per-body data
+      const CANVAS_H_local = CANVAS_H;
+      let totalKE = 0, totalPE = 0;
+      const bodyList = [];
+
+      dyn.forEach(b => {
+        const speed = Math.hypot(b.velocity.x, b.velocity.y);
+        const ke = 0.5 * b.mass * speed * speed;
+        const pe = b.mass * Math.abs(engine.gravity.y) * Math.max(0, CANVAS_H_local - b.position.y);
+        totalKE += ke;
+        totalPE += pe;
+
+        const point = {
+          t: tickRef.current, speed: +speed.toFixed(2),
+          angVel: +Math.abs(b.angularVelocity).toFixed(4),
+          x: b.position.x, y: b.position.y, ke: +ke.toFixed(2), pe: +pe.toFixed(2),
+        };
+
+        if (!bodyHistoryRef.current[b.label]) bodyHistoryRef.current[b.label] = [];
+        const hist = bodyHistoryRef.current[b.label];
+        hist.push(point);
+        if (hist.length > MAX_POINTS) hist.splice(0, hist.length - MAX_POINTS);
+
+        bodyList.push({
+          label: b.label,
+          name: bodyNamesRef.current[b.label] || b.label,
+          color: b.render?.fillStyle || '#3b82f6',
+          type: b.circleRadius ? 'circle' : 'box',
+          current: {
+            x: b.position.x, y: b.position.y,
+            vx: b.velocity.x, vy: b.velocity.y,
+            speed, angle: b.angle, angVel: Math.abs(b.angularVelocity),
+            mass: b.mass, ke, pe,
+            radius: b.circleRadius || 0,
+            width: b._w || 0,
+            height: b._h || 0,
+            friction: b.friction,
+            restitution: b.restitution,
+            motor: bodyMotorsRef.current[b.label] || null,
+          },
+          history: [...hist],
+        });
+      });
+
+      // Clean up removed bodies
+      const liveLabels = new Set(dyn.map(b => b.label));
+      Object.keys(bodyHistoryRef.current).forEach(lbl => {
+        if (!liveLabels.has(lbl)) {
+          delete bodyHistoryRef.current[lbl];
+          delete bodyNamesRef.current[lbl];
+        }
+      });
+
+      // Clamp selected index
+      let idx = selectedBodyIdxRef.current;
+      if (bodyList.length > 0) {
+        if (idx >= bodyList.length) idx = bodyList.length - 1;
+        if (idx < 0) idx = 0;
+      }
+
+      setPerBodySnapshot({
+        list: bodyList,
+        selected: bodyList[idx] || null,
+        selectedIndex: idx,
+        systemStats: { totalBodies: dyn.length, totalKE, totalPE },
       });
 
       // Update constraint overlay metadata
       setConstraintsMeta(getConstraintsMeta(engine));
+    });
+
+    renderRef.current = render;
+
+    // ── Highlight selected body on canvas ────────────────────────────────
+    Events.on(render, 'afterRender', () => {
+      const dyn = Composite.allBodies(engine.world).filter(b => !b.isStatic);
+      if (dyn.length === 0) return;
+      let idx = selectedBodyIdxRef.current;
+      if (idx >= dyn.length) idx = dyn.length - 1;
+      if (idx < 0) idx = 0;
+      const body = dyn[idx];
+      if (!body) return;
+
+      const ctx = render.context;
+      const verts = body.vertices;
+      const cx = body.position.x;
+      const cy = body.position.y;
+
+      // ── Yellow highlight border ──────────────────────────────────────
+      ctx.save();
+      ctx.strokeStyle = 'rgba(234, 179, 8, 0.9)';
+      ctx.lineWidth = 3;
+      ctx.shadowColor = 'rgba(234, 179, 8, 0.6)';
+      ctx.shadowBlur = 16;
+      ctx.beginPath();
+      ctx.moveTo(verts[0].x, verts[0].y);
+      for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.restore();
+
+      // ── Floating name label ──────────────────────────────────────────
+      const name = bodyNamesRef.current[body.label] || body.label;
+      ctx.save();
+      ctx.font = '700 11px Inter, system-ui, sans-serif';
+      const textW = ctx.measureText(name).width;
+      const tagW = textW + 16;
+      const tagH = 20;
+      const tagX = cx - tagW / 2;
+      const tagY = cy - 48;
+
+      ctx.fillStyle = 'rgba(234, 179, 8, 0.95)';
+      ctx.shadowColor = 'rgba(0,0,0,0.2)';
+      ctx.shadowBlur = 6;
+      ctx.beginPath();
+      ctx.roundRect(tagX, tagY, tagW, tagH, 4);
+      ctx.fill();
+
+      // Pointer arrow
+      ctx.shadowBlur = 0;
+      ctx.beginPath();
+      ctx.moveTo(cx - 5, tagY + tagH);
+      ctx.lineTo(cx, tagY + tagH + 6);
+      ctx.lineTo(cx + 5, tagY + tagH);
+      ctx.fill();
+
+      // Text
+      ctx.fillStyle = '#1a1a1a';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(name, cx, tagY + tagH / 2);
+      ctx.restore();
     });
 
     Render.run(render);
@@ -458,6 +840,37 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
 
   // ── Keep activeToolRef in sync ─────────────────────────────────────────────
   useEffect(() => { activeToolRef.current = activeTool; }, [activeTool]);
+
+  // ── Keyboard navigation for body selector (← →) ─────────────────────────
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        const list = perBodySnapshot.list;
+        if (!list || list.length === 0) return;
+        setSelectedBodyIdx(prev => {
+          let next;
+          if (e.key === 'ArrowLeft') next = prev <= 0 ? list.length - 1 : prev - 1;
+          else next = prev >= list.length - 1 ? 0 : prev + 1;
+          selectedBodyIdxRef.current = next;
+          return next;
+        });
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [perBodySnapshot.list]);
+
+  // ── Sync selected body when index changes ─────────────────────────────────
+  useEffect(() => {
+    if (perBodySnapshot.list && perBodySnapshot.list.length > 0) {
+      const idx = Math.min(selectedBodyIdx, perBodySnapshot.list.length - 1);
+      setPerBodySnapshot(prev => ({
+        ...prev,
+        selected: prev.list[idx] || null,
+        selectedIndex: idx,
+      }));
+    }
+  }, [selectedBodyIdx]);
 
   // ── Link tool click listener ──────────────────────────────────────────────
   useEffect(() => {
@@ -522,11 +935,12 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
         const platform = Matter.Bodies.rectangle(cx, cy, length, 12, {
           isStatic: true,
           label: uid,
-          angle,
+          _w: length, _h: 12,
           render: { fillStyle: '#64748b' },
           friction: materialsRef.current.friction,
           restitution: materialsRef.current.restitution,
         });
+        Matter.Body.setAngle(platform, angle);
         Matter.Composite.add(engineRef.current.world, platform);
 
         socketRef.current?.emit('spawn_item', {
@@ -675,6 +1089,83 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
   const handleAddCircle = () => { spawnAt('circle', (sceneRef.current?.clientWidth || 800) / 2, 60); };
   const handleAddSpring = () => { spawnAt('spring', (sceneRef.current?.clientWidth || 800) / 2, 60); };
 
+  // ── Update individual body properties from inspector ────────────────────
+  const handleUpdateBody = useCallback((label, prop, value) => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    const body = Matter.Composite.allBodies(engine.world).find(b => b.label === label);
+    if (!body) return;
+    const { Body } = Matter;
+
+    switch (prop) {
+      case 'mass':
+        Body.setMass(body, Math.max(0.1, value));
+        break;
+      case 'radius': {
+        // Scale circle to new radius
+        const oldR = body.circleRadius || 30;
+        if (oldR > 0 && value > 0) {
+          const s = value / oldR;
+          Body.scale(body, s, s);
+          body.circleRadius = value;
+        }
+        break;
+      }
+      case 'width': {
+        const oldW = body._w || 60;
+        if (oldW > 0 && value > 0) {
+          const savedAngle = body.angle;
+          Body.setAngle(body, 0);
+          Body.scale(body, value / oldW, 1);
+          Body.setAngle(body, savedAngle);
+          body._w = value;
+        }
+        break;
+      }
+      case 'height': {
+        const oldH = body._h || 60;
+        if (oldH > 0 && value > 0) {
+          const savedAngle = body.angle;
+          Body.setAngle(body, 0);
+          Body.scale(body, 1, value / oldH);
+          Body.setAngle(body, savedAngle);
+          body._h = value;
+        }
+        break;
+      }
+      case 'friction':
+        body.friction = Math.max(0, value);
+        break;
+      case 'restitution':
+        body.restitution = Math.max(0, Math.min(1, value));
+        break;
+      case 'motor_toggle': {
+        if (value) {
+          bodyMotorsRef.current[label] = { angularVelocity: 0.1, angularAcceleration: 0, currentVel: 0.1 };
+        } else {
+          delete bodyMotorsRef.current[label];
+          Body.setAngularVelocity(body, 0);
+        }
+        break;
+      }
+      case 'motor_angularVelocity': {
+        const m = bodyMotorsRef.current[label];
+        if (m) { m.angularVelocity = value; m.currentVel = value; }
+        break;
+      }
+      case 'motor_angularAcceleration': {
+        const m = bodyMotorsRef.current[label];
+        if (m) m.angularAcceleration = value;
+        break;
+      }
+      default:
+        break;
+    }
+
+    // Sync to peers
+    socketRef.current?.emit('update_body', { label, prop, value });
+  }, []);
+
   const handleCanvasDrop = (e) => {
     e.preventDefault();
     const shapeType = e.dataTransfer.getData('shapeType');
@@ -721,7 +1212,13 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
     });
     Composite.remove(engineRef.current.world, bodiesToRemove);
     Composite.remove(engineRef.current.world, Composite.allConstraints(engineRef.current.world).filter((c) => c.label !== 'Mouse Constraint'));
-    setAnalyticsData([]);
+    bodyHistoryRef.current = {};
+    bodyNamesRef.current = {};
+    bodyNameCounterRef.current = { box: 0, circle: 0, other: 0 };
+    bodyMotorsRef.current = {};
+    selectedBodyIdxRef.current = 0;
+    setSelectedBodyIdx(0);
+    setPerBodySnapshot({ list: [], selected: null, systemStats: null });
     motorsRef.current.clear();
     constraintsMapRef.current.clear();
     setSelectedConstraint(null);
@@ -731,7 +1228,7 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
     socketRef.current?.emit('clear_canvas');
   };
 
-  // ── Save / Restore ─────────────────────────────────────────────────────────
+  // ── Save / Restore (localStorage) ──────────────────────────────────────────
   const handleSave = () => {
     const data = serializeWorld(engineRef.current);
     localStorage.setItem('vlab_save', JSON.stringify(data));
@@ -751,6 +1248,141 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
       Body.setVelocity(body, { x: s.vx, y: s.vy });
       Composite.add(engineRef.current.world, body);
     });
+  };
+
+  // ── Cloud Save ─────────────────────────────────────────────────────────────
+  const handleCloudSave = async () => {
+    if (!saveName.trim()) return;
+    setCloudSaving(true);
+    setCloudMsg('');
+    try {
+      const { bodies, constraints, bodyMotors, simRunning: sr } = serializeWorldFull(
+        engineRef.current, bodyMotorsRef.current, simRunningRef.current
+      );
+      const res = await fetch(`${SERVER_URL}/api/simulations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: saveName.trim(), roomId, createdBy: userName, bodies, constraints, bodyMotors, simRunning: sr }),
+      });
+      if (!res.ok) throw new Error('Save failed');
+      setCloudMsg('Saved!');
+      setSaveName('');
+      setTimeout(() => { setShowSaveModal(false); setCloudMsg(''); }, 1200);
+    } catch (err) {
+      setCloudMsg('Error: ' + err.message);
+    } finally {
+      setCloudSaving(false);
+    }
+  };
+
+  // ── Cloud Load ─────────────────────────────────────────────────────────────
+  const handleOpenLoadModal = async () => {
+    setShowLoadModal(true);
+    setCloudLoading(true);
+    setCloudMsg('');
+    try {
+      const res = await fetch(`${SERVER_URL}/api/simulations`);
+      if (!res.ok) throw new Error('Failed to fetch');
+      const data = await res.json();
+      setSavedSims(data);
+    } catch (err) {
+      setCloudMsg('Error: ' + err.message);
+    } finally {
+      setCloudLoading(false);
+    }
+  };
+
+  const handleCloudLoad = async (simId) => {
+    setCloudLoading(true);
+    try {
+      const res = await fetch(`${SERVER_URL}/api/simulations/${simId}`);
+      if (!res.ok) throw new Error('Failed to load');
+      const sim = await res.json();
+      const { Bodies, Composite, Body, Constraint } = Matter;
+
+      // Clear current canvas first
+      const bodiesToRemove = Composite.allBodies(engineRef.current.world).filter((b) => {
+        if (!b.isStatic) return true;
+        if (b.label?.startsWith('wall') || b.label === 'ground') return false;
+        return true;
+      });
+      Composite.remove(engineRef.current.world, bodiesToRemove);
+      Composite.remove(engineRef.current.world, Composite.allConstraints(engineRef.current.world).filter((c) => c.label !== 'Mouse Constraint'));
+      motorsRef.current.clear();
+      constraintsMapRef.current.clear();
+      bodyMotorsRef.current = {};
+      bodyHistoryRef.current = {};
+      bodyNamesRef.current = {};
+      bodyNameCounterRef.current = { box: 0, circle: 0, other: 0 };
+
+      // Restore bodies
+      const labelToBody = {};
+      (sim.bodies || []).forEach((b) => {
+        let body;
+        if (b.isCircle) {
+          body = Bodies.circle(b.x, b.y, b.circleRadius, {
+            label: b.label, isStatic: b.isStatic,
+            render: { fillStyle: b.color },
+            friction: b.friction, restitution: b.restitution, frictionAir: b.frictionAir,
+          });
+        } else {
+          body = Bodies.rectangle(b.x, b.y, b.width, b.height, {
+            label: b.label, isStatic: b.isStatic,
+            _w: b.width, _h: b.height,
+            render: { fillStyle: b.color },
+            friction: b.friction, restitution: b.restitution, frictionAir: b.frictionAir,
+          });
+        }
+        Body.setAngle(body, b.angle || 0);
+        if (!b.isStatic) {
+          Body.setVelocity(body, { x: b.vx || 0, y: b.vy || 0 });
+          if (b.mass != null) Body.setMass(body, b.mass);
+        }
+        labelToBody[b.label] = body;
+        Composite.add(engineRef.current.world, body);
+      });
+
+      // Restore constraints
+      (sim.constraints || []).forEach((c) => {
+        const bodyA = labelToBody[c.bodyALabel];
+        const bodyB = labelToBody[c.bodyBLabel];
+        if (bodyA && bodyB) {
+          Composite.add(engineRef.current.world, Constraint.create({
+            bodyA, bodyB, length: c.length, stiffness: c.stiffness,
+            render: { strokeStyle: c.strokeStyle, lineWidth: c.lineWidth },
+          }));
+        }
+      });
+
+      // Restore motors
+      if (sim.bodyMotors) {
+        Object.entries(sim.bodyMotors).forEach(([label, motorConf]) => {
+          bodyMotorsRef.current[label] = { ...motorConf };
+        });
+      }
+
+      // Restore sim running state
+      if (sim.simRunning != null) {
+        simRunningRef.current = sim.simRunning;
+        setSimRunning(sim.simRunning);
+      }
+
+      setShowLoadModal(false);
+      setCloudMsg('');
+    } catch (err) {
+      setCloudMsg('Error: ' + err.message);
+    } finally {
+      setCloudLoading(false);
+    }
+  };
+
+  const handleCloudDelete = async (simId) => {
+    try {
+      await fetch(`${SERVER_URL}/api/simulations/${simId}`, { method: 'DELETE' });
+      setSavedSims((prev) => prev.filter((s) => s._id !== simId));
+    } catch (err) {
+      setCloudMsg('Delete failed');
+    }
   };
 
   // ── Sidebar button style helper ─────────────────────────────────────────────
@@ -840,6 +1472,33 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
 
         {/* Right: Actions */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          {/* ── Play / Stop ────────────────────────────────── */}
+          <button id="btn-play" onClick={() => {
+            if (engineRef.current) engineRef.current.gravity.y = materialsRef.current.gravity;
+            simRunningRef.current = true;
+            setSimRunning(true);
+            socketRef.current?.emit('toggle_sim', { running: true });
+          }} style={{
+            padding: '6px 14px', borderRadius: '8px',
+            border: simRunning ? '1px solid #bbf7d0' : '1px solid #e5e5e4',
+            background: simRunning ? '#dcfce7' : '#fff',
+            fontSize: '12px', fontWeight: 600,
+            color: simRunning ? '#16a34a' : '#777',
+            cursor: 'pointer', transition: 'all 0.2s',
+          }}>▶ Play</button>
+          <button id="btn-stop" onClick={() => {
+            simRunningRef.current = false;
+            setSimRunning(false);
+            socketRef.current?.emit('toggle_sim', { running: false });
+          }} style={{
+            padding: '6px 14px', borderRadius: '8px',
+            border: !simRunning ? '1px solid #fecaca' : '1px solid #e5e5e4',
+            background: !simRunning ? '#fef2f2' : '#fff',
+            fontSize: '12px', fontWeight: 600,
+            color: !simRunning ? '#dc2626' : '#777',
+            cursor: 'pointer', transition: 'all 0.2s',
+          }}>⏹ Stop</button>
+          <div style={{ width: '1px', height: '20px', background: '#e5e5e4', margin: '0 4px' }} />
           <button onClick={handleSave} style={{
             padding: '6px 14px', borderRadius: '8px', border: '1px solid #e5e5e4',
             background: '#fff', fontSize: '12px', fontWeight: 500, color: '#777',
@@ -852,6 +1511,17 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
               cursor: 'pointer',
             }}>Restore</button>
           )}
+          <div style={{ width: '1px', height: '20px', background: '#e5e5e4', margin: '0 4px' }} />
+          <button onClick={() => { setShowSaveModal(true); setCloudMsg(''); setSaveName(''); }} style={{
+            padding: '6px 14px', borderRadius: '8px', border: '1px solid #bfdbfe',
+            background: '#eff6ff', fontSize: '12px', fontWeight: 500, color: '#2563eb',
+            cursor: 'pointer', transition: 'all 0.2s',
+          }}>☁ Save</button>
+          <button onClick={handleOpenLoadModal} style={{
+            padding: '6px 14px', borderRadius: '8px', border: '1px solid #bfdbfe',
+            background: '#eff6ff', fontSize: '12px', fontWeight: 500, color: '#2563eb',
+            cursor: 'pointer', transition: 'all 0.2s',
+          }}>☁ Load</button>
           <button onClick={handleClear} style={{
             padding: '6px 14px', borderRadius: '8px', border: '1px solid #fecaca',
             background: '#fef2f2', fontSize: '12px', fontWeight: 500, color: '#dc2626',
@@ -885,31 +1555,31 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
 
           <button id="btn-select-tool" onClick={() => { setActiveTool('select'); handleCancelLink(); }}
             style={{ ...sideBtn, borderColor: activeTool === 'select' ? '#0f766e' : '#e5e5e4', background: activeTool === 'select' ? '#ecfdf5' : '#fff' }}>
-            <span style={sideBtnIcon}>↖</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/><path d="M13 13l6 6"/></svg>
             <span style={{ ...sideBtnLabel, color: activeTool === 'select' ? '#0f766e' : '#555553' }}>Select</span>
           </button>
 
           <button id="btn-link-tool" onClick={() => { setActiveTool(activeTool === 'link' ? 'select' : 'link'); handleCancelLink(); }}
             style={{ ...sideBtn, borderColor: activeTool === 'link' ? '#0f766e' : '#e5e5e4', background: activeTool === 'link' ? '#ecfdf5' : '#fff' }}>
-            <span style={sideBtnIcon}>🔗</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
             <span style={{ ...sideBtnLabel, color: activeTool === 'link' ? '#0f766e' : '#555553' }}>Link</span>
           </button>
 
           <button id="btn-pivot-tool" onClick={() => { setActiveTool(activeTool === 'pivot' ? 'select' : 'pivot'); handleCancelLink(); }}
             style={{ ...sideBtn, borderColor: activeTool === 'pivot' ? '#0f766e' : '#e5e5e4', background: activeTool === 'pivot' ? '#ecfdf5' : '#fff' }}>
-            <span style={sideBtnIcon}>📌</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>
             <span style={{ ...sideBtnLabel, color: activeTool === 'pivot' ? '#0f766e' : '#555553' }}>Pivot</span>
           </button>
 
           <button id="btn-cut-tool" onClick={() => { setActiveTool(activeTool === 'cut' ? 'select' : 'cut'); handleCancelLink(); }}
             style={{ ...sideBtn, borderColor: activeTool === 'cut' ? '#dc2626' : '#e5e5e4', background: activeTool === 'cut' ? '#fef2f2' : '#fff' }}>
-            <span style={sideBtnIcon}>✂️</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>
             <span style={{ ...sideBtnLabel, color: activeTool === 'cut' ? '#dc2626' : '#555553' }}>Cut</span>
           </button>
 
           <button id="btn-platform-tool" onClick={() => { setActiveTool(activeTool === 'platform' ? 'select' : 'platform'); handleCancelLink(); setPlatformStart(null); }}
             style={{ ...sideBtn, borderColor: activeTool === 'platform' ? '#6366f1' : '#e5e5e4', background: activeTool === 'platform' ? '#eef2ff' : '#fff' }}>
-            <span style={sideBtnIcon}>▁</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="10" width="18" height="4" rx="1"/></svg>
             <span style={{ ...sideBtnLabel, color: activeTool === 'platform' ? '#6366f1' : '#555553' }}>Platform</span>
           </button>
 
@@ -923,7 +1593,7 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
             onDragStart={(e) => { e.dataTransfer.setData('shapeType', 'box'); }}
             onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#0f766e'; }}
             onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e5e5e4'; }}>
-            <span style={sideBtnIcon}>□</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
             <span style={sideBtnLabel}>Square</span>
           </button>
 
@@ -931,7 +1601,7 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
             onDragStart={(e) => { e.dataTransfer.setData('shapeType', 'circle'); }}
             onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#0f766e'; }}
             onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e5e5e4'; }}>
-            <span style={sideBtnIcon}>○</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/></svg>
             <span style={sideBtnLabel}>Circle</span>
           </button>
 
@@ -943,33 +1613,15 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
           <button id="btn-pendulum" onClick={() => handleBlueprint('pendulum')} style={sideBtn}
             onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#0f766e'; }}
             onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e5e5e4'; }}>
-            <span style={sideBtnIcon}>⏚</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="6" x2="12" y2="18"/><circle cx="12" cy="20" r="2"/></svg>
             <span style={sideBtnLabel}>Pendulum</span>
           </button>
 
-          <button id="btn-dominoes" onClick={() => handleBlueprint('dominoes')} style={sideBtn}
+          <button id="btn-add-spring" onClick={handleAddSpring} style={sideBtn}
             onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#0f766e'; }}
             onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e5e5e4'; }}>
-            <span style={sideBtnIcon}>▮</span>
-            <span style={sideBtnLabel}>Dominoes</span>
-          </button>
-
-          <button id="btn-ramp" onClick={() => handleBlueprint('ramp')} style={sideBtn}
-            onMouseEnter={(e) => { e.currentTarget.style.borderColor = '#0f766e'; }}
-            onMouseLeave={(e) => { e.currentTarget.style.borderColor = '#e5e5e4'; }}>
-            <span style={sideBtnIcon}>◢</span>
-            <span style={sideBtnLabel}>Ramp</span>
-          </button>
-
-          {/* Divider */}
-          <div style={{ height: '1px', background: '#e5e5e4', margin: '4px 0' }} />
-
-          <button id="btn-toggle-materials" onClick={() => setShowMaterials((v) => !v)}
-            style={{ ...sideBtn, borderColor: showMaterials ? '#0f766e' : '#e5e5e4', background: showMaterials ? '#ecfdf5' : '#ffffff' }}
-            onMouseEnter={(e) => { if (!showMaterials) e.currentTarget.style.borderColor = '#0f766e'; }}
-            onMouseLeave={(e) => { if (!showMaterials) e.currentTarget.style.borderColor = '#e5e5e4'; }}>
-            <span style={sideBtnIcon}>⚙</span>
-            <span style={{ ...sideBtnLabel, color: showMaterials ? '#0f766e' : '#555553' }}>Physics</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 12c2-3 4-3 6 0s4 3 6 0 4-3 6 0s4 3 6 0"/></svg>
+            <span style={sideBtnLabel}>Spring</span>
           </button>
         </div>
 
@@ -1055,12 +1707,177 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
               onDelete={handleDeleteConstraint}
             />
           )}
-          {showMaterials && (
-            <MaterialsPanel materials={materials} onChange={handleMaterialChange} />
-          )}
-          <AnalyticsDashboard data={analyticsData} />
+          <BodyAnalytics
+            selectedBody={perBodySnapshot.selected}
+            bodyList={perBodySnapshot.list}
+            selectedIndex={perBodySnapshot.selectedIndex ?? 0}
+            onPrev={() => {
+              const list = perBodySnapshot.list;
+              if (!list || list.length === 0) return;
+              setSelectedBodyIdx(prev => {
+                const next = prev <= 0 ? list.length - 1 : prev - 1;
+                selectedBodyIdxRef.current = next;
+                return next;
+              });
+            }}
+            onNext={() => {
+              const list = perBodySnapshot.list;
+              if (!list || list.length === 0) return;
+              setSelectedBodyIdx(prev => {
+                const next = prev >= list.length - 1 ? 0 : prev + 1;
+                selectedBodyIdxRef.current = next;
+                return next;
+              });
+            }}
+            systemStats={perBodySnapshot.systemStats}
+            canvasH={canvasSize.h}
+            onUpdateBody={handleUpdateBody}
+          />
         </div>
       </div>
+
+      {/* ── Cloud Save Modal ──────────────────────────────────────────── */}
+      {showSaveModal && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+          backdropFilter: 'blur(4px)',
+        }} onClick={() => setShowSaveModal(false)}>
+          <div style={{
+            background: '#fff', borderRadius: '16px', padding: '32px',
+            width: '400px', maxWidth: '90vw',
+            boxShadow: '0 8px 32px rgba(0,0,0,0.12)',
+            fontFamily: "'Inter', -apple-system, sans-serif",
+          }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ fontSize: '18px', fontWeight: 700, marginBottom: '8px', color: '#1a1a1a' }}>
+              ☁ Save to Cloud
+            </h3>
+            <p style={{ fontSize: '13px', color: '#9a9a98', marginBottom: '20px' }}>
+              Save this simulation to MongoDB for access from any device.
+            </p>
+            <input
+              type="text"
+              value={saveName}
+              onChange={(e) => setSaveName(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleCloudSave()}
+              placeholder="Simulation name (e.g. Pendulum Demo)"
+              autoFocus
+              style={{
+                width: '100%', padding: '12px 14px', borderRadius: '10px',
+                border: '1px solid #d4d4d3', fontSize: '14px', color: '#1a1a1a',
+                outline: 'none', boxSizing: 'border-box', marginBottom: '16px',
+                transition: 'border-color 0.2s',
+              }}
+              onFocus={(e) => { e.target.style.borderColor = '#2563eb'; }}
+              onBlur={(e) => { e.target.style.borderColor = '#d4d4d3'; }}
+            />
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <button
+                onClick={handleCloudSave}
+                disabled={cloudSaving || !saveName.trim()}
+                style={{
+                  padding: '10px 24px', borderRadius: '10px', border: 'none',
+                  background: saveName.trim() ? '#2563eb' : '#bfdbfe',
+                  color: '#fff', fontSize: '14px', fontWeight: 600,
+                  cursor: saveName.trim() ? 'pointer' : 'not-allowed',
+                  transition: 'all 0.2s',
+                }}
+              >
+                {cloudSaving ? 'Saving...' : 'Save'}
+              </button>
+              <button
+                onClick={() => setShowSaveModal(false)}
+                style={{
+                  padding: '10px 20px', borderRadius: '10px',
+                  border: '1px solid #e5e5e4', background: '#fff',
+                  color: '#777', fontSize: '14px', fontWeight: 500, cursor: 'pointer',
+                }}
+              >Cancel</button>
+              {cloudMsg && (
+                <span style={{
+                  fontSize: '13px', fontWeight: 500, marginLeft: '8px',
+                  color: cloudMsg.startsWith('Error') ? '#dc2626' : '#16a34a',
+                }}>{cloudMsg}</span>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Cloud Load Modal ──────────────────────────────────────────── */}
+      {showLoadModal && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+          backdropFilter: 'blur(4px)',
+        }} onClick={() => setShowLoadModal(false)}>
+          <div style={{
+            background: '#fff', borderRadius: '16px', padding: '32px',
+            width: '500px', maxWidth: '90vw', maxHeight: '70vh',
+            boxShadow: '0 8px 32px rgba(0,0,0,0.12)',
+            fontFamily: "'Inter', -apple-system, sans-serif",
+            display: 'flex', flexDirection: 'column',
+          }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ fontSize: '18px', fontWeight: 700, marginBottom: '8px', color: '#1a1a1a' }}>
+              ☁ Load from Cloud
+            </h3>
+            <p style={{ fontSize: '13px', color: '#9a9a98', marginBottom: '16px' }}>
+              Select a saved simulation to restore.
+            </p>
+            {cloudMsg && (
+              <p style={{ fontSize: '13px', color: '#dc2626', marginBottom: '12px' }}>{cloudMsg}</p>
+            )}
+            <div style={{ flex: 1, overflowY: 'auto', marginBottom: '16px' }}>
+              {cloudLoading ? (
+                <div style={{ textAlign: 'center', padding: '32px', color: '#9a9a98', fontSize: '14px' }}>
+                  Loading...
+                </div>
+              ) : savedSims.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '32px', color: '#9a9a98', fontSize: '14px' }}>
+                  No saved simulations found.
+                </div>
+              ) : (
+                savedSims.map((sim) => (
+                  <div key={sim._id} style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    padding: '12px 16px', borderRadius: '10px', marginBottom: '6px',
+                    border: '1px solid #e5e5e4', background: '#fafafa',
+                    transition: 'background 0.15s, border-color 0.15s',
+                    cursor: 'pointer',
+                  }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = '#eff6ff'; e.currentTarget.style.borderColor = '#bfdbfe'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = '#fafafa'; e.currentTarget.style.borderColor = '#e5e5e4'; }}
+                    onClick={() => handleCloudLoad(sim._id)}
+                  >
+                    <div>
+                      <div style={{ fontSize: '14px', fontWeight: 600, color: '#1a1a1a' }}>{sim.name}</div>
+                      <div style={{ fontSize: '11px', color: '#9a9a98', marginTop: '2px' }}>
+                        {sim.createdBy} · {sim.roomId || 'no room'} · {new Date(sim.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                      </div>
+                    </div>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleCloudDelete(sim._id); }}
+                      style={{
+                        padding: '4px 10px', borderRadius: '6px', border: '1px solid #fecaca',
+                        background: '#fef2f2', fontSize: '11px', fontWeight: 500, color: '#dc2626',
+                        cursor: 'pointer', transition: 'all 0.15s',
+                      }}
+                    >Delete</button>
+                  </div>
+                ))
+              )}
+            </div>
+            <button
+              onClick={() => setShowLoadModal(false)}
+              style={{
+                padding: '10px 20px', borderRadius: '10px', alignSelf: 'flex-end',
+                border: '1px solid #e5e5e4', background: '#fff',
+                color: '#777', fontSize: '14px', fontWeight: 500, cursor: 'pointer',
+              }}
+            >Close</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

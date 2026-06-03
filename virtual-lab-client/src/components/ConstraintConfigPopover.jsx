@@ -1,9 +1,11 @@
 import { useState } from 'react';
 
+const rodIcon = <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="5" x2="19" y2="19"/><circle cx="5" cy="5" r="2" fill="currentColor"/><circle cx="19" cy="19" r="2" fill="currentColor"/></svg>;
+const springIcon = <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="4" cy="12" r="2" fill="currentColor"/><path d="M6 12c1.5-4 3-4 4.5 0s3 4 4.5 0 3-4 4.5 0"/><circle cx="20" cy="12" r="2" fill="currentColor"/></svg>;
+
 const TYPES = [
-  { key: 'rope',   icon: '🪢', label: 'Rod',    desc: 'Fixed distance, no elasticity' },
-  { key: 'spring', icon: '⌇',  label: 'Spring', desc: 'Elastic with stiffness & damping' },
-  { key: 'motor',  icon: '⚙',  label: 'Motor',  desc: 'Driven rotation at set speed' },
+  { key: 'rope',   icon: rodIcon,    label: 'Rod',    desc: 'Fixed distance, no elasticity' },
+  { key: 'spring', icon: springIcon,  label: 'Spring', desc: 'Elastic with stiffness & damping' },
 ];
 
 const DEFAULT_CONFIGS = {
@@ -125,7 +127,7 @@ const ConstraintConfigPopover = ({ posX, posY, autoLength, onConfirm, onCancel }
             onMouseEnter={e => { if (selectedType !== key) e.currentTarget.style.borderColor = '#0f766e40'; }}
             onMouseLeave={e => { if (selectedType !== key) e.currentTarget.style.borderColor = '#e5e5e4'; }}
           >
-            <span style={{ fontSize: 22, lineHeight: 1 }}>{icon}</span>
+            <span style={{ fontSize: 22, lineHeight: 1, color: selectedType === key ? '#0f766e' : '#888' }}>{icon}</span>
             <span style={{ fontSize: 11, fontWeight: 600, color: selectedType === key ? '#0f766e' : '#555' }}>
               {label}
             </span>
@@ -164,37 +166,6 @@ const ConstraintConfigPopover = ({ posX, posY, autoLength, onConfirm, onCancel }
               unit="px" color="#6366f1"
               onChange={(v) => updateConfig('spring', 'restLength', v)}
             />
-          </>
-        )}
-
-
-        {selectedType === 'motor' && (
-          <>
-            <SliderRow
-              label="Angular Velocity" value={Math.abs(activeConfig.angularVelocity)}
-              min={0.5} max={20} step={0.5}
-              unit=" rad/s" color="#ef4444"
-              onChange={(v) => updateConfig('motor', 'angularVelocity', v)}
-            />
-            <div style={{ display: 'flex', gap: 8 }}>
-              {[
-                { dir: 1,  label: '↻ CW' },
-                { dir: -1, label: '↺ CCW' },
-              ].map(({ dir, label }) => (
-                <button
-                  key={dir}
-                  onClick={() => updateConfig('motor', 'direction', dir)}
-                  style={{
-                    flex: 1, padding: '8px 0', borderRadius: 8,
-                    border: `1.5px solid ${activeConfig.direction === dir ? '#0f766e' : '#e5e5e4'}`,
-                    background: activeConfig.direction === dir ? '#ecfdf5' : '#fff',
-                    cursor: 'pointer', fontSize: 12, fontWeight: 600,
-                    color: activeConfig.direction === dir ? '#0f766e' : '#888',
-                    transition: 'all 0.15s',
-                  }}
-                >{label}</button>
-              ))}
-            </div>
           </>
         )}
       </div>
