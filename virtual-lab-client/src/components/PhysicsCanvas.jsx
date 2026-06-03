@@ -12,6 +12,9 @@ import { spawnPendulum, spawnDominoes, spawnRamp } from '../blueprints';
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
 const MAX_POINTS = 60;
 
+const WORLD_W = 1400;  // Fixed world width — same for every client
+const WORLD_H = 800;   // Fixed world height — same for every client
+
 const HOST_SYNC_INTERVAL = 150; // ms between host state broadcasts
 
 const genUID = () => `b_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
@@ -169,7 +172,7 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
   const [cursorPos, setCursorPos] = useState(null);
   const [constraintsMeta, setConstraintsMeta] = useState([]);
   const [selectedConstraint, setSelectedConstraint] = useState(null);
-  const [canvasSize, setCanvasSize] = useState({ w: 800, h: 600 });
+  const [canvasSize, setCanvasSize] = useState({ w: WORLD_W, h: WORLD_H });
   const [platformStart, setPlatformStart] = useState(null); // { x, y } first click for platform tool
   const motorsRef = useRef(new Map());                     // uid -> { bodyB, angularVelocity }
   const bodyMotorsRef = useRef({});                         // label -> { angularVelocity, angularAcceleration, currentVel }
@@ -187,18 +190,51 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
     engine.constraintIterations = 10;  // default is 2 — higher = more rigid constraints
     engine.positionIterations = 10;    // helps prevent bodies from passing through each other
 
-    // Measure container to fill it
+    // Use fixed world dimensions for a consistent coordinate system across all clients
     const container = sceneRef.current;
-    const CANVAS_W = container.clientWidth;
-    const CANVAS_H = container.clientHeight;
+    const CANVAS_W = WORLD_W;
+    const CANVAS_H = WORLD_H;
 
     const render = Render.create({
       element: container,
       engine,
-      options: { width: CANVAS_W, height: CANVAS_H, wireframes: false, background: 'transparent' },
+      options: { width: CANVAS_W, height: CANVAS_H, wireframes: false, background: 'transparent', pixelRatio: 1 },
     });
 
-    // Walls + ground (sized to fill the container)
+    // CSS-scale the canvas to fit the container while keeping aspect ratio
+    const fitCanvas = () => {
+      const cw = container.clientWidth;
+      const ch = container.clientHeight;
+      if (!cw || !ch) return;
+      const worldAspect = CANVAS_W / CANVAS_H;
+      const containerAspect = cw / ch;
+      let dw, dh;
+      if (containerAspect > worldAspect) {
+        dh = ch;
+        dw = ch * worldAspect;
+      } else {
+        dw = cw;
+        dh = cw / worldAspect;
+      }
+      render.canvas.style.width = dw + 'px';
+      render.canvas.style.height = dh + 'px';
+      render.canvas.style.position = 'absolute';
+      render.canvas.style.left = ((cw - dw) / 2) + 'px';
+      render.canvas.style.top = ((ch - dh) / 2) + 'px';
+    };
+    fitCanvas();
+    window.addEventListener('resize', fitCanvas);
+
+    // Helper: convert CSS pixel coords (relative to canvas rect) to world coords
+    const cssToWorld = (cssX, cssY) => {
+      const rect = render.canvas.getBoundingClientRect();
+      return {
+        x: (cssX / rect.width) * CANVAS_W,
+        y: (cssY / rect.height) * CANVAS_H,
+      };
+    };
+
+    // Walls + ground (fixed world coordinates — identical for every client)
     const ground = Bodies.rectangle(CANVAS_W / 2, CANVAS_H + 10, CANVAS_W + 20, 40, { isStatic: true, label: 'ground', render: { fillStyle: '#d4d4d3' } });
     const wallL = Bodies.rectangle(-10, CANVAS_H / 2, 20, CANVAS_H, { isStatic: true, label: 'wallL', render: { fillStyle: 'transparent' } });
     const wallR = Bodies.rectangle(CANVAS_W + 10, CANVAS_H / 2, 20, CANVAS_H, { isStatic: true, label: 'wallR', render: { fillStyle: 'transparent' } });
@@ -217,8 +253,9 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
       const tool = activeToolRef.current;
       if (tool !== 'link' && tool !== 'pivot' && tool !== 'cut' && tool !== 'platform') return;
       const rect = render.canvas.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
+      const cssX = e.clientX - rect.left;
+      const cssY = e.clientY - rect.top;
+      const { x, y } = cssToWorld(cssX, cssY);
 
       // Platform tool doesn't need a body
       if (tool === 'platform') {
@@ -245,7 +282,9 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
       const tool = activeToolRef.current;
       if (tool !== 'link' && tool !== 'platform') return;
       const rect = render.canvas.getBoundingClientRect();
-      setCursorPos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+      const cssX = e.clientX - rect.left;
+      const cssY = e.clientY - rect.top;
+      setCursorPos(cssToWorld(cssX, cssY));
     });
 
     // ── Socket ─────────────────────────────────────────────────────────────
@@ -880,6 +919,7 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
       Runner.stop(runner);
       Engine.clear(engine);
       socket.disconnect();
+      window.removeEventListener('resize', fitCanvas);
       if (render.canvas) render.canvas.remove();
     };
   }, [roomId]);
@@ -1131,9 +1171,9 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
     }
   };
 
-  const handleAddBox = () => { spawnAt('box', (sceneRef.current?.clientWidth || 800) / 2, 60); };
-  const handleAddCircle = () => { spawnAt('circle', (sceneRef.current?.clientWidth || 800) / 2, 60); };
-  const handleAddSpring = () => { spawnAt('spring', (sceneRef.current?.clientWidth || 800) / 2, 60); };
+  const handleAddBox = () => { spawnAt('box', WORLD_W / 2, 60); };
+  const handleAddCircle = () => { spawnAt('circle', WORLD_W / 2, 60); };
+  const handleAddSpring = () => { spawnAt('spring', WORLD_W / 2, 60); };
 
   // ── Update individual body properties from inspector ────────────────────
   const handleUpdateBody = useCallback((label, prop, value) => {
@@ -1219,8 +1259,10 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
     const canvas = sceneRef.current?.querySelector('canvas');
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const cssX = e.clientX - rect.left;
+    const cssY = e.clientY - rect.top;
+    const x = (cssX / rect.width) * WORLD_W;
+    const y = (cssY / rect.height) * WORLD_H;
     if (shapeType === 'pendulum' || shapeType === 'dominoes' || shapeType === 'ramp') {
       handleBlueprint(shapeType);
     } else {
@@ -1678,7 +1720,7 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
           onDragOver={(e) => { e.preventDefault(); }}
           onDrop={handleCanvasDrop}
         >
-          <div ref={sceneRef} style={{ position: 'absolute', inset: 0 }} />
+          <div ref={sceneRef} style={{ position: 'absolute', inset: 0, overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' }} />
           <ConstraintOverlay
             width={canvasSize.w}
             height={canvasSize.h}
