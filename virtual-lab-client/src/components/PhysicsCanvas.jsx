@@ -136,6 +136,7 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
   const draggedLabelRef = useRef(null); // label of body currently being dragged locally
   const pendingHostSync = useRef(null); // buffered host state, applied in afterUpdate
   const simRunningRef = useRef(true);   // is the simulation playing?
+  const receivedRoomState = useRef(false); // has the peer received the initial room state?
   const bodyHistoryRef = useRef({});     // { [label]: [{t, speed, angVel, x, y, ke, pe}] }
   const bodyNameCounterRef = useRef({ box: 0, circle: 0, other: 0 }); // for friendly names
   const bodyNamesRef = useRef({});       // { [label]: 'Box 1' }
@@ -251,7 +252,18 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
     const socket = io(SERVER_URL);
     socketRef.current = socket;
 
-    socket.on('connect', () => socket.emit('join_room', roomId));
+    socket.on('connect', () => {
+      socket.emit('join_room', roomId);
+      // If this is a reconnection, re-request state
+      if (!receivedRoomState.current) {
+        setTimeout(() => {
+          if (!receivedRoomState.current) {
+            console.log('State not received yet, re-requesting...');
+            socket.emit('request_room_state');
+          }
+        }, 3000);
+      }
+    });
     socket.on('room_user_count', (count) => setUserCount(count));
 
     // ── Role assignment from server ─────────────────────────────────────
@@ -268,6 +280,9 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
 
     // ── Room state sync: receive all existing items when joining ──────
     socket.on('room_state', ({ bodies: bodyArr, constraints: constraintArr, bodyMotors: motorsData, simRunning: remoteSimRunning }) => {
+      receivedRoomState.current = true;
+      console.log(`Received room_state: ${bodyArr?.length || 0} bodies, ${constraintArr?.length || 0} constraints`);
+      if (!bodyArr) return;
       const labelToBody = {};
       bodyArr.forEach((b) => {
         let body;
@@ -588,6 +603,7 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
             _w: b._w, _h: b._h, mass: b.mass,
             friction: b.friction, restitution: b.restitution,
             circleRadius: b.circleRadius || 0,
+            color: b.render?.fillStyle || '#3b82f6',
             motor: bodyMotorsRef.current[b.label] || null,
           }));
           socket.emit('host_sync', syncData);
@@ -627,7 +643,37 @@ const PhysicsCanvas = ({ roomId, userName, onLeave }) => {
         allBodies.forEach((b) => { bodyMap[b.label] = b; });
 
         syncData.forEach((hb) => {
-          const localBody = bodyMap[hb.label];
+          let localBody = bodyMap[hb.label];
+
+          // If this body doesn't exist locally, create it from the host data
+          if (!localBody) {
+            let newBody;
+            if (hb.circleRadius > 0) {
+              newBody = Bodies.circle(hb.x, hb.y, hb.circleRadius, {
+                label: hb.label,
+                render: { fillStyle: hb.color || '#3b82f6' },
+                friction: hb.friction ?? 0.1,
+                restitution: hb.restitution ?? 0.6,
+              });
+            } else if (hb._w && hb._h) {
+              newBody = Bodies.rectangle(hb.x, hb.y, hb._w, hb._h, {
+                label: hb.label,
+                _w: hb._w, _h: hb._h,
+                render: { fillStyle: hb.color || '#3b82f6' },
+                friction: hb.friction ?? 0.1,
+                restitution: hb.restitution ?? 0.6,
+              });
+            }
+            if (newBody) {
+              if (hb.mass != null) Body.setMass(newBody, hb.mass);
+              Body.setAngle(newBody, hb.angle || 0);
+              Body.setVelocity(newBody, { x: hb.vx || 0, y: hb.vy || 0 });
+              Composite.add(engine.world, newBody);
+              bodyMap[hb.label] = newBody;
+              localBody = newBody;
+            }
+          }
+
           if (!localBody || localBody.isStatic) return;
           // Skip body being dragged locally — dragger owns it
           if (draggedLabelRef.current === hb.label) return;

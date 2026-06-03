@@ -153,6 +153,17 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ── Peer can explicitly re-request room state ─────────────────
+  socket.on('request_room_state', () => {
+    const roomId = socket.roomId;
+    if (!roomId) return;
+    const hostId = roomHosts[roomId];
+    if (hostId && hostId !== socket.id) {
+      io.to(hostId).emit('request_state', socket.id);
+      console.log(`  → ${socket.id} re-requested state from host ${hostId}`);
+    }
+  });
+
   // ── Relay live state snapshot to the new joiner ────────────────
   socket.on('state_snapshot', ({ targetSocketId, bodies, constraints, bodyMotors, simRunning }) => {
     io.to(targetSocketId).emit('room_state', { bodies, constraints, bodyMotors, simRunning });
