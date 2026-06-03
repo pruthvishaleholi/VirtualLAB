@@ -35,6 +35,7 @@
 - [Usage Guide](#-usage-guide)
 - [Multiplayer Architecture](#-multiplayer-architecture)
 - [Deployment](#-deployment)
+- [UI](#-ui)
 - [Contributing](#-contributing)
 
 ---
@@ -401,6 +402,18 @@ This outputs optimized static files to `dist/`. Deploy to:
 - Any static file host
 
 > **Important:** Set the `VITE_SERVER_URL` environment variable in your hosting platform to point to your deployed server URL **before** building.
+
+---
+
+## 🖼 UI
+
+### Lobby Screen
+
+![Lobby Screen](screenshots/lobby-screen.png)
+
+### Simulation Canvas
+
+![Simulation Canvas](screenshots/simulation-canvas.png)
 
 ---
 
