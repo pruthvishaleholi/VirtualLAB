@@ -35,7 +35,6 @@
 - [Usage Guide](#-usage-guide)
 - [Multiplayer Architecture](#-multiplayer-architecture)
 - [Deployment](#-deployment)
-- [UI](#-ui)
 - [Contributing](#-contributing)
 
 ---
@@ -45,6 +44,17 @@
 **VirtualLab** is a browser-based, multi-user physics simulation workbench built for education and experimentation. Users join shared rooms, spawn rigid bodies, connect them with constraints (rods, springs, motors, pivots), and observe real-time physics — all synchronized across every connected peer via WebSockets.
 
 It is designed as a professional-grade engineering sandbox suitable for college-level physics demonstrations, featuring per-body analytics, energy tracking, a property inspector, and drag-and-drop interaction.
+
+
+### Lobby Screen
+
+![Lobby Screen](screenshots/lobby-screen.png)
+
+### Simulation Canvas
+
+![Simulation Canvas](screenshots/simulation-canvas.png)
+
+
 
 ---
 
@@ -405,17 +415,7 @@ This outputs optimized static files to `dist/`. Deploy to:
 
 ---
 
-## 🖼 UI
 
-### Lobby Screen
-
-![Lobby Screen](screenshots/lobby-screen.png)
-
-### Simulation Canvas
-
-![Simulation Canvas](screenshots/simulation-canvas.png)
-
----
 
 ## 🤝 Contributing
 
